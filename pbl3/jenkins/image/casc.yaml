@@ -1,0 +1,60 @@
+# Jenkins Configuration as Code. ${...} values are passed in by scripts/setup.sh.
+jenkins:
+  systemMessage: "MediCare Patient Portal - DevOps PBL-III (PBL 7 CI/CD | PBL 8 Blue-Green | PBL 9 DevSecOps)"
+  numExecutors: 3
+  securityRealm:
+    local:
+      allowsSignup: false
+      users:
+        - id: admin
+          password: "${JENKINS_ADMIN_PASSWORD}"
+  authorizationStrategy:
+    loggedInUsersCanDoAnything:
+      allowAnonymousRead: false
+  globalNodeProperties:
+    - envVars:
+        env:
+          - key: NODE_IP
+            value: "${NODE_IP}"
+
+credentials:
+  system:
+    domainCredentials:
+      - credentials:
+          - string:
+              scope: GLOBAL
+              id: medicare-secret-key
+              description: "App secret key for the PBL 9 healthcare app (injected as a K8s Secret)"
+              secret: "${APP_SECRET_KEY}"
+
+jobs:
+  - script: |
+      def repo = '${REPO_URL}'
+      def jobs = [
+        'pbl7-cicd'      : ['jenkins/Jenkinsfile.pbl7', 'PBL 7 - CI/CD pipeline deploying the Dockerized app to Kubernetes'],
+        'pbl8-blue-green': ['jenkins/Jenkinsfile.pbl8', 'PBL 8 - Automated Blue-Green deployment (Jenkins + Kubernetes + Docker)'],
+        'pbl9-devsecops' : ['jenkins/Jenkinsfile.pbl9', 'PBL 9 - DevSecOps pipeline for a healthcare system'],
+      ]
+      jobs.each { name, cfg ->
+        pipelineJob(name) {
+          description(cfg[1])
+          if (name == 'pbl8-blue-green') {
+            parameters {
+              choiceParam('ACTION', ['deploy', 'rollback'], 'deploy = release to idle colour; rollback = switch traffic back')
+              booleanParam('AUTO_APPROVE', false, 'Skip the manual switch approval')
+            }
+          }
+          definition {
+            cpsScm {
+              scm {
+                git {
+                  remote { url(repo) }
+                  branch('*/main')
+                }
+              }
+              scriptPath(cfg[0])
+              lightweight(false)
+            }
+          }
+        }
+      }

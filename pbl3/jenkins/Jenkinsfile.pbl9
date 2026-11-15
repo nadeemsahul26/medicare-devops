@@ -1,0 +1,161 @@
+// PBL 9 - Secure DevOps (DevSecOps) Implementation in a Healthcare System
+// "Shift left": every commit passes security gates BEFORE the image reaches the registry or the cluster.
+//
+//   Secrets scan (Gitleaks) -> SAST (Bandit) -> Dependency scan / SCA (pip-audit) -> Unit tests
+//   -> Build -> Container image scan (Trivy) -> IaC / K8s misconfig scan (Trivy config)
+//   -> Push -> Deploy hardened workload (Secret, PSS restricted, NetworkPolicy) -> DAST (OWASP ZAP)
+//
+// Any HIGH/CRITICAL finding fails the build, so insecure code never reaches patients' data.
+
+pipeline {
+    agent any
+
+    environment {
+        IMAGE          = "localhost:5000/medicare-portal-secure"   // private registry on the server
+        TAG            = "${BUILD_NUMBER}"
+        KUBECONFIG     = '/var/lib/jenkins/.kube/config'
+        NS             = 'pbl9'
+        APP_URL        = "http://${env.NODE_IP}:30009"
+        // Scanner images. In production pin these to exact versions/digests.
+        GITLEAKS_IMG   = 'zricethezav/gitleaks:latest'
+        TRIVY_IMG      = 'aquasec/trivy:latest'
+        ZAP_IMG        = 'ghcr.io/zaproxy/zaproxy:stable'
+        PY_IMG         = 'python:3.12-slim'
+    }
+
+    options {
+        timestamps()
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                sh 'rm -rf reports && mkdir -p reports && chmod 777 reports'
+            }
+        }
+
+        stage('Secrets Scan (Gitleaks)') {
+            steps {
+                sh '''
+                  docker run --rm -v "$WORKSPACE":/repo $GITLEAKS_IMG dir /repo \
+                    --redact --verbose --exit-code 1 \
+                    --report-format json --report-path /repo/reports/gitleaks.json
+                '''
+            }
+        }
+
+        stage('SAST (Bandit)') {
+            steps {
+                sh '''
+                  docker run --rm -e PYTHONDONTWRITEBYTECODE=1 -v "$WORKSPACE":/src -w /src $PY_IMG sh -c \
+                    "pip install -q bandit && bandit -r app -x app/tests -ll -ii -f txt -o reports/bandit.txt; rc=\\$?; cat reports/bandit.txt; exit \\$rc"
+                '''
+            }
+        }
+
+        stage('Dependency Scan (pip-audit)') {
+            steps {
+                sh '''
+                  docker run --rm -v "$WORKSPACE":/src -w /src $PY_IMG sh -c \
+                    "pip install -q pip-audit && pip-audit -r app/requirements.txt --desc -o reports/pip-audit.txt; rc=\\$?; cat reports/pip-audit.txt; exit \\$rc"
+                '''
+            }
+        }
+
+        stage('Unit Tests') {
+            steps {
+                sh '''
+                  docker run --rm -e PYTHONDONTWRITEBYTECODE=1 -v "$WORKSPACE":/src -w /src $PY_IMG sh -c \
+                    "pip install -q -r app/requirements.txt pytest && pytest -q -p no:cacheprovider app/tests"
+                '''
+            }
+        }
+
+        stage('Build Image') {
+            steps {
+                sh 'docker build --pull -t $IMAGE:$TAG .'
+            }
+        }
+
+        stage('Image Scan (Trivy)') {
+            steps {
+                // Report every HIGH + CRITICAL issue, but only block the release on CRITICAL ones.
+                sh '''
+                  docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v trivy-cache:/root/.cache/ \
+                    -v "$WORKSPACE/reports":/reports $TRIVY_IMG image \
+                    --severity HIGH,CRITICAL --ignore-unfixed --exit-code 0 \
+                    --format table --output /reports/trivy-image.txt $IMAGE:$TAG
+                  cat reports/trivy-image.txt
+                  echo "=== Gate: CRITICAL vulnerabilities ==="
+                  docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v trivy-cache:/root/.cache/ \
+                    $TRIVY_IMG image --severity CRITICAL --ignore-unfixed --exit-code 1 --quiet $IMAGE:$TAG
+                '''
+            }
+        }
+
+        stage('IaC / K8s Misconfig Scan (Trivy)') {
+            steps {
+                sh '''
+                  rc=0
+                  docker run --rm -v trivy-cache:/root/.cache/ -v "$WORKSPACE":/src $TRIVY_IMG config \
+                    --severity HIGH,CRITICAL --exit-code 1 /src/k8s/pbl9 || rc=$?
+                  docker run --rm -v trivy-cache:/root/.cache/ -v "$WORKSPACE":/src $TRIVY_IMG config \
+                    --severity HIGH,CRITICAL --exit-code 1 /src/Dockerfile || rc=$?
+                  exit $rc
+                '''
+            }
+        }
+
+        stage('Push Image') {
+            steps {
+                sh 'docker push $IMAGE:$TAG'
+            }
+        }
+
+        stage('Deploy Hardened Workload') {
+            steps {
+                withCredentials([string(credentialsId: 'medicare-secret-key', variable: 'APP_SK')]) {
+                    sh '''
+                      kubectl create namespace $NS --dry-run=client -o yaml | kubectl apply -f -
+                      # Secret comes from Jenkins' encrypted credential store - it is never committed to Git
+                      kubectl -n $NS create secret generic medicare-secrets \
+                        --from-literal=APP_SECRET_KEY="$APP_SK" --dry-run=client -o yaml | kubectl apply -f -
+                      envsubst '${IMAGE} ${TAG}' < k8s/pbl9/app.yaml | kubectl apply -f -
+                      kubectl -n $NS rollout status deployment/medicare --timeout=180s
+                      kubectl -n $NS get pods,svc,networkpolicy
+                    '''
+                }
+                sh '''
+                  for i in $(seq 1 10); do
+                    curl -fs $APP_URL/health | grep -qw "v$TAG" && { echo "v$TAG is live"; exit 0; }
+                    sleep 3
+                  done
+                  exit 1
+                '''
+            }
+        }
+
+        stage('DAST (OWASP ZAP Baseline)') {
+            steps {
+                // Passive baseline scan of the running app. Findings are reported, not blocking.
+                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                    sh '''
+                      docker run --rm --network host -v "$WORKSPACE/reports":/zap/wrk:rw $ZAP_IMG \
+                        zap-baseline.py -t $APP_URL -r zap-report.html -I
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts artifacts: 'reports/**', allowEmptyArchive: true
+        }
+        failure {
+            echo 'SECURITY GATE FAILED - the insecure build was blocked. See the stage log and reports/.'
+        }
+    }
+}

@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Git server hook = our "webhook". Every push notifies Jenkins straight away.
+# Put [pbl7], [pbl8] or [pbl9] in the commit message to start only that pipeline; no tag = all three.
+while read -r old new ref; do
+  [ "$new" = "0000000000000000000000000000000000000000" ] && continue
+  msg="$(git log -1 --format=%s "$new")"
+  jobs=""
+  [[ "$msg" == *"[pbl7]"* ]] && jobs="$jobs pbl7-cicd"
+  [[ "$msg" == *"[pbl8]"* ]] && jobs="$jobs pbl8-blue-green"
+  [[ "$msg" == *"[pbl9]"* ]] && jobs="$jobs pbl9-devsecops"
+  [ -z "$jobs" ] && jobs="pbl7-cicd pbl8-blue-green pbl9-devsecops"
+  for j in $jobs; do
+    echo "[git hook] new commit \"$msg\" -> triggering Jenkins job: $j"
+    setsid nohup /usr/local/bin/jenkins-cli build "$j" >/dev/null 2>&1 < /dev/null &
+  done
+done

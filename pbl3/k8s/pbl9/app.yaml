@@ -1,0 +1,115 @@
+# PBL 9 - DevSecOps for a healthcare system. Hardened deployment:
+#   * Namespace enforces the "restricted" Pod Security Standard
+#   * Non-root, read-only filesystem, no privilege escalation, all Linux capabilities dropped
+#   * Secret key injected from a Kubernetes Secret (created by Jenkins from its credential store, never in Git)
+#   * Dedicated ServiceAccount with no API token mounted (least privilege)
+#   * NetworkPolicy: only port 5000 in, only DNS out
+# ${IMAGE} and ${TAG} are filled in by Jenkins with envsubst.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pbl9
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: medicare-sa
+  namespace: pbl9
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: medicare
+  namespace: pbl9
+  labels: { app: medicare }
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+  selector:
+    matchLabels: { app: medicare }
+  template:
+    metadata:
+      labels: { app: medicare }
+    spec:
+      serviceAccountName: medicare-sa
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: medicare
+          image: ${IMAGE}:${TAG}
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 5000
+          env:
+            - { name: APP_VERSION, value: "v${TAG}" }
+            - { name: APP_COLOR, value: "green" }
+            - { name: PBL_MODE, value: "pbl9 devsecops" }
+            - name: APP_SECRET_KEY
+              valueFrom:
+                secretKeyRef: { name: medicare-secrets, key: APP_SECRET_KEY }
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            privileged: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+            seccompProfile: { type: RuntimeDefault }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+          readinessProbe:
+            httpGet: { path: /health, port: 5000 }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /health, port: 5000 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 250m, memory: 256Mi }
+      volumes:
+        - name: tmp
+          emptyDir: { medium: Memory, sizeLimit: 32Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: medicare
+  namespace: pbl9
+spec:
+  type: NodePort
+  selector: { app: medicare }
+  ports:
+    - port: 80
+      targetPort: 5000
+      nodePort: 30009
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: medicare-netpol
+  namespace: pbl9
+spec:
+  podSelector: { matchLabels: { app: medicare } }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - ports:
+        - { protocol: TCP, port: 5000 }
+  egress:
+    - ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }

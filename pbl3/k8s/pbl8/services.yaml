@@ -1,0 +1,34 @@
+# PBL 8 - two Services.
+#   medicare          (NodePort 30008) = LIVE traffic. Its selector "version" decides blue or green.
+#   medicare-preview  (NodePort 30018) = points at the IDLE colour so it can be tested before the switch.
+# Jenkins fills ${LIVE_COLOR} and ${IDLE_COLOR}.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pbl8
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: medicare
+  namespace: pbl8
+spec:
+  type: NodePort
+  selector: { app: medicare, version: "${LIVE_COLOR}" }
+  ports:
+    - port: 80
+      targetPort: 5000
+      nodePort: 30008
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: medicare-preview
+  namespace: pbl8
+spec:
+  type: NodePort
+  selector: { app: medicare, version: "${IDLE_COLOR}" }
+  ports:
+    - port: 80
+      targetPort: 5000
+      nodePort: 30018

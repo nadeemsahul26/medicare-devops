@@ -1,0 +1,159 @@
+// PBL 8 - Automated Blue-Green Deployment Strategy using Jenkins, Kubernetes, Docker
+// Two identical environments (blue + green). Only one gets live traffic.
+// Jenkins deploys the new version to the IDLE colour, tests it through a preview Service,
+// waits for approval, then flips the live Service selector. The old colour keeps running
+// so rollback is one selector change.
+
+pipeline {
+    agent any
+
+    parameters {
+        choice(name: 'ACTION', choices: ['deploy', 'rollback'],
+               description: 'deploy = release new version to the idle colour; rollback = switch traffic back instantly')
+        booleanParam(name: 'AUTO_APPROVE', defaultValue: false,
+                     description: 'Skip the manual "switch traffic?" approval')
+    }
+
+    environment {
+        IMAGE          = "localhost:5000/medicare-portal"          // private registry on the server
+        TAG            = "${BUILD_NUMBER}"
+        KUBECONFIG     = '/var/lib/jenkins/.kube/config'
+        NS             = 'pbl8'
+        LIVE_URL       = "http://${env.NODE_IP}:30008"
+        PREVIEW_URL    = "http://${env.NODE_IP}:30018"
+    }
+
+    options {
+        timestamps()
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        disableConcurrentBuilds()
+    }
+
+    stages {
+        stage('Checkout') {
+            steps { checkout scm }
+        }
+
+        stage('Detect Live Colour') {
+            steps {
+                script {
+                    // First ever run: create the Services (live -> green, which does not exist yet,
+                    // preview -> blue) so the very first release goes to blue.
+                    def exists = sh(script: 'kubectl -n pbl8 get svc medicare >/dev/null 2>&1', returnStatus: true) == 0
+                    if (!exists) {
+                        sh "LIVE_COLOR=green IDLE_COLOR=blue envsubst '\${LIVE_COLOR} \${IDLE_COLOR}' < k8s/pbl8/services.yaml | kubectl apply -f -"
+                    }
+                    env.LIVE_COLOR = sh(script: "kubectl -n pbl8 get svc medicare -o jsonpath='{.spec.selector.version}'",
+                                        returnStdout: true).trim()
+                    env.IDLE_COLOR = (env.LIVE_COLOR == 'blue') ? 'green' : 'blue'
+                    echo "LIVE = ${env.LIVE_COLOR}   IDLE (target) = ${env.IDLE_COLOR}"
+                }
+            }
+        }
+
+        stage('Unit Tests') {
+            when { expression { params.ACTION == 'deploy' } }
+            steps {
+                sh '''
+                  docker run --rm -e PYTHONDONTWRITEBYTECODE=1 -v "$WORKSPACE":/src -w /src python:3.12-slim sh -c \
+                    "pip install -q -r app/requirements.txt pytest && pytest -q -p no:cacheprovider app/tests"
+                '''
+            }
+        }
+
+        stage('Build & Push Image') {
+            when { expression { params.ACTION == 'deploy' } }
+            steps {
+                sh 'docker build --pull -t $IMAGE:$TAG . && docker push $IMAGE:$TAG'
+            }
+        }
+
+        stage('Deploy to Idle Colour') {
+            when { expression { params.ACTION == 'deploy' } }
+            steps {
+                sh '''
+                  echo "Deploying v$TAG to $IDLE_COLOR (users are still on $LIVE_COLOR)"
+                  COLOR=$IDLE_COLOR envsubst '${COLOR} ${IMAGE} ${TAG}' < k8s/pbl8/deployment.yaml | kubectl apply -f -
+                  kubectl -n $NS rollout status deployment/medicare-$IDLE_COLOR --timeout=180s
+                  kubectl -n $NS patch svc medicare-preview -p "{\\"spec\\":{\\"selector\\":{\\"app\\":\\"medicare\\",\\"version\\":\\"$IDLE_COLOR\\"}}}"
+                  kubectl -n $NS get deploy,pods -o wide
+                '''
+            }
+        }
+
+        stage('Test Idle via Preview') {
+            when { expression { params.ACTION == 'deploy' } }
+            steps {
+                sh '''
+                  for i in $(seq 1 15); do
+                    OUT=$(curl -fs $PREVIEW_URL/health || true)
+                    echo "$OUT"
+                    if echo "$OUT" | grep -qw "v$TAG" && echo "$OUT" | grep -qw "$IDLE_COLOR"; then
+                      curl -fs $PREVIEW_URL/ | grep -q "Vitals Checker"
+                      curl -fs $PREVIEW_URL/patients | grep -q "Patient Directory"
+                      echo "Preview tests passed on $IDLE_COLOR"; exit 0
+                    fi
+                    sleep 3
+                  done
+                  echo "Preview tests FAILED - live traffic was never touched"; exit 1
+                '''
+            }
+        }
+
+        stage('Approve Switch') {
+            when { expression { params.ACTION == 'deploy' && !params.AUTO_APPROVE } }
+            steps {
+                timeout(time: 10, unit: 'MINUTES') {
+                    input message: "Preview OK on ${env.PREVIEW_URL}. Switch live traffic ${env.LIVE_COLOR} -> ${env.IDLE_COLOR}?",
+                          ok: 'Switch traffic'
+                }
+            }
+        }
+
+        stage('Switch Traffic') {
+            steps {
+                script {
+                    // deploy: idle becomes live.  rollback: the previous colour becomes live again.
+                    def newLive = env.IDLE_COLOR
+                    def newIdle = env.LIVE_COLOR
+                    if (params.ACTION == 'rollback') {
+                        def exists = sh(script: "kubectl -n ${env.NS} get deploy medicare-${newLive} >/dev/null 2>&1", returnStatus: true) == 0
+                        if (!exists) { error("Nothing to roll back to: medicare-${newLive} does not exist") }
+                    }
+                    env.SWITCHED_FROM = env.LIVE_COLOR
+                    sh """
+                      kubectl -n ${env.NS} patch svc medicare         -p '{"spec":{"selector":{"app":"medicare","version":"${newLive}"}}}'
+                      kubectl -n ${env.NS} patch svc medicare-preview -p '{"spec":{"selector":{"app":"medicare","version":"${newIdle}"}}}'
+                    """
+                    env.NEW_LIVE = newLive
+                    echo "LIVE is now ${newLive}. ${newIdle} is kept running for instant rollback."
+                }
+            }
+        }
+
+        stage('Verify Live') {
+            steps {
+                sh '''
+                  for i in $(seq 1 10); do
+                    OUT=$(curl -fs $LIVE_URL/health || true)
+                    echo "$OUT"
+                    echo "$OUT" | grep -qw "$NEW_LIVE" && { echo "Live traffic is on $NEW_LIVE"; exit 0; }
+                    sleep 2
+                  done
+                  exit 1
+                '''
+            }
+        }
+    }
+
+    post {
+        failure {
+            script {
+                if (env.SWITCHED_FROM) {
+                    echo "Live verification failed - switching traffic back to ${env.SWITCHED_FROM}"
+                    sh "kubectl -n ${env.NS} patch svc medicare -p '{\"spec\":{\"selector\":{\"app\":\"medicare\",\"version\":\"${env.SWITCHED_FROM}\"}}}' || true"
+                }
+            }
+        }
+    }
+}

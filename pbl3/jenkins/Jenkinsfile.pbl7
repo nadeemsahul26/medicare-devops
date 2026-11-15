@@ -1,0 +1,83 @@
+// PBL 7 - CI/CD Pipeline to deploy a Dockerized application on Kubernetes using Jenkins
+// Flow: GitHub push -> Jenkins -> unit tests -> docker build -> push to image registry
+//       -> kubectl rolling update -> smoke test -> auto-rollback on failure
+
+pipeline {
+    agent any
+
+    environment {
+        IMAGE          = "localhost:5000/medicare-portal"          // private registry on the server
+        TAG            = "${BUILD_NUMBER}"
+        KUBECONFIG     = '/var/lib/jenkins/.kube/config'
+        NS             = 'pbl7'
+        APP_URL        = "http://${env.NODE_IP}:30007"
+    }
+
+    options {
+        timestamps()
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+    }
+
+    stages {
+        stage('Checkout') {
+            steps { checkout scm }
+        }
+
+        stage('Unit Tests') {
+            steps {
+                sh '''
+                  docker run --rm -e PYTHONDONTWRITEBYTECODE=1 -v "$WORKSPACE":/src -w /src python:3.12-slim sh -c \
+                    "pip install -q -r app/requirements.txt pytest && pytest -q -p no:cacheprovider app/tests"
+                '''
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                sh 'docker build --pull -t $IMAGE:$TAG -t $IMAGE:latest .'
+            }
+        }
+
+        stage('Push to Registry') {
+            steps {
+                sh 'docker push $IMAGE:$TAG && docker push $IMAGE:latest'
+            }
+        }
+
+        stage('Deploy to Kubernetes') {
+            steps {
+                script { env.DEPLOYED = 'true' }
+                sh '''
+                  envsubst '${IMAGE} ${TAG}' < k8s/pbl7/app.yaml | kubectl apply -f -
+                  kubectl -n $NS rollout status deployment/medicare --timeout=180s
+                  kubectl -n $NS get pods -o wide
+                '''
+            }
+        }
+
+        stage('Smoke Test') {
+            steps {
+                sh '''
+                  for i in $(seq 1 10); do
+                    if curl -fs $APP_URL/health | grep -qw "v$TAG"; then
+                      echo "Smoke test passed - v$TAG is live"; exit 0
+                    fi
+                    sleep 3
+                  done
+                  echo "Smoke test failed"; exit 1
+                '''
+            }
+        }
+    }
+
+    post {
+        failure {
+            script {
+                if (env.DEPLOYED == 'true') {
+                    echo 'Deployment failed - rolling back to the previous version'
+                    sh 'kubectl -n $NS rollout undo deployment/medicare || true'
+                }
+            }
+        }
+    }
+}

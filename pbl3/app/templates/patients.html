@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <h2>Patient Directory</h2>
+  <p>Names and phone numbers are masked before they leave the server (PII minimisation).</p>
+  <table>
+    <tr><th>ID</th><th>Name</th><th>Phone</th><th>Ward</th></tr>
+    {% for p in patients %}
+    <tr><td>{{ p.id }}</td><td>{{ p.name }}</td><td>{{ p.phone }}</td><td>{{ p.ward }}</td></tr>
+    {% endfor %}
+  </table>
+</div>
+{% endblock %}

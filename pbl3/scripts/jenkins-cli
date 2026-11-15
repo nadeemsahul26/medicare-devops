@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Small wrapper: run a Jenkins CLI command against the local Jenkins (must be run as root / with sudo).
+PASS="$(cat /root/jenkins-admin-password.txt)"
+docker exec jenkins sh -c '[ -s /tmp/cli.jar ] || curl -fso /tmp/cli.jar http://localhost:8080/jnlpJars/jenkins-cli.jar'
+exec docker exec jenkins java -jar /tmp/cli.jar -s http://localhost:8080/ -auth "admin:$PASS" "$@"
